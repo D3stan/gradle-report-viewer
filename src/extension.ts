@@ -18,8 +18,32 @@ export function activate(context: vscode.ExtensionContext) {
     const reportsProvider = new GradleReportsProvider(workspaceRootUri, context);
     vscode.window.registerTreeDataProvider('gradleReportView', reportsProvider);
 
-    const filtersProvider = new GradleReportFiltersProvider(workspaceRootUri, context, reportsProvider); // Pass reportsProvider
-    vscode.window.registerTreeDataProvider('gradleReportFiltersView', filtersProvider);
+    const filtersProvider = new GradleReportFiltersProvider(workspaceRootUri, context, reportsProvider);
+    // Use createTreeView so we can listen for checkbox state changes
+    const filtersTreeView = vscode.window.createTreeView('gradleReportFiltersView', {
+        treeDataProvider: filtersProvider
+    });
+    context.subscriptions.push(filtersTreeView);
+
+    // When the user clicks directly on a checkbox VS Code toggles the visual state but
+    // no command is invoked. Catch that event and delegate to the same toggle commands
+    // we use for label-clicks so that the configuration updates correctly.
+    filtersTreeView.onDidChangeCheckboxState(async (e) => {
+        for (const [treeItem] of e.items) {
+            const item = treeItem as FilterEntryItem | undefined as any;
+            if (!item || typeof item.entryType !== 'string') {
+                // Ignore category rows or unknown items
+                continue;
+            }
+
+            const label = item.label as string;
+            if (item.entryType === 'publisher') {
+                await vscode.commands.executeCommand('gradle-report-viewer.togglePublisherSelection', label);
+            } else if (item.entryType === 'extension') {
+                await vscode.commands.executeCommand('gradle-report-viewer.toggleExtensionSelection', label);
+            }
+        }
+    });
 
     context.subscriptions.push(vscode.commands.registerCommand('gradle-report-viewer.showReports', () => {
         reportsProvider.refresh();
@@ -87,11 +111,7 @@ export function activate(context: vscode.ExtensionContext) {
         let selectedPublishers = config.get<string[]>('selectedPublishers') || [];
         const allDiscovered = await reportsProvider.getDiscoveredPublishers();
 
-        // If selectedPublishers is empty, it means all are implicitly selected.
-        // So, if toggling one, we need to populate it with all EXCEPT the one being unselected.
-        if (selectedPublishers.length === 0) {
-            selectedPublishers = [...allDiscovered];
-        }
+        // If the list is empty, it represents 'no publisher selected'. We'll build it up as the user checks boxes.
 
         const index = selectedPublishers.indexOf(publisherName);
         if (index > -1) {
@@ -99,12 +119,7 @@ export function activate(context: vscode.ExtensionContext) {
         } else {
             selectedPublishers.push(publisherName);
         }
-        // If after toggle, selectedPublishers now contains all discovered, reset to empty array for "show all"
-        if (selectedPublishers.length === allDiscovered.length && allDiscovered.every(p => selectedPublishers.includes(p))) {
-            await config.update('selectedPublishers', [], vscode.ConfigurationTarget.Global);
-        } else {
-            await config.update('selectedPublishers', selectedPublishers, vscode.ConfigurationTarget.Global);
-        }
+        await config.update('selectedPublishers', selectedPublishers, vscode.ConfigurationTarget.Global);
     }));
 
     context.subscriptions.push(vscode.commands.registerCommand('gradle-report-viewer.toggleExtensionSelection', async (extension: string) => {
@@ -112,9 +127,7 @@ export function activate(context: vscode.ExtensionContext) {
         let selectedExtensions = config.get<string[]>('selectedExtensions') || [];
         const allDiscoveredExts = await reportsProvider.getDiscoveredFileExtensions(); // Assuming this method exists
 
-        if (selectedExtensions.length === 0) {
-            selectedExtensions = [...allDiscoveredExts];
-        }
+        // Empty list means no extensions selected yet.
 
         const index = selectedExtensions.indexOf(extension);
         if (index > -1) {
@@ -122,12 +135,25 @@ export function activate(context: vscode.ExtensionContext) {
         } else {
             selectedExtensions.push(extension);
         }
-        if (selectedExtensions.length === allDiscoveredExts.length && allDiscoveredExts.every(e => selectedExtensions.includes(e))) {
-            await config.update('selectedExtensions', [], vscode.ConfigurationTarget.Global);
-        } else {
-            await config.update('selectedExtensions', selectedExtensions, vscode.ConfigurationTarget.Global);
-        }
+        await config.update('selectedExtensions', selectedExtensions, vscode.ConfigurationTarget.Global);
     }));
+
+    // Ensure default selections so that an empty config (first install) shows all items.
+    (async () => {
+        const cfg = vscode.workspace.getConfiguration('gradle-report-viewer');
+        if ((cfg.get<string[]>('selectedPublishers') || []).length === 0) {
+            const pubs = await reportsProvider.getDiscoveredPublishers();
+            if (pubs.length) {
+                await cfg.update('selectedPublishers', pubs, vscode.ConfigurationTarget.Global);
+            }
+        }
+        if ((cfg.get<string[]>('selectedExtensions') || []).length === 0) {
+            const exts = await reportsProvider.getDiscoveredFileExtensions();
+            if (exts.length) {
+                await cfg.update('selectedExtensions', exts, vscode.ConfigurationTarget.Global);
+            }
+        }
+    })();
 
     console.log('Congratulations, your extension "gradle-report-viewer" is now active!');
 }
@@ -206,12 +232,10 @@ export class GradleReportsProvider implements vscode.TreeDataProvider<vscode.Tre
         }
 
         const allDiscoveredPublishers = await this.getDiscoveredPublishers();
-        let configSelectedPublishers = vscode.workspace.getConfiguration('gradle-report-viewer').get<string[]>('selectedPublishers') || [];
-        const effectiveSelectedPublishers = configSelectedPublishers.length > 0 ? configSelectedPublishers : allDiscoveredPublishers;
+        const effectiveSelectedPublishers = vscode.workspace.getConfiguration('gradle-report-viewer').get<string[]>('selectedPublishers') || [];
 
         const allDiscoveredExtensions = await this.getDiscoveredFileExtensions();
-        let configSelectedExtensions = vscode.workspace.getConfiguration('gradle-report-viewer').get<string[]>('selectedExtensions') || [];
-        const effectiveSelectedExtensions = configSelectedExtensions.length > 0 ? configSelectedExtensions : allDiscoveredExtensions;
+        const effectiveSelectedExtensions = vscode.workspace.getConfiguration('gradle-report-viewer').get<string[]>('selectedExtensions') || [];
 
         if (allDiscoveredPublishers.length === 0 && !element) {
             vscode.window.showInformationMessage('No report subfolders found in build/reports. Please build your project.');
@@ -343,16 +367,14 @@ export class GradleReportFiltersProvider implements vscode.TreeDataProvider<vsco
             if (element.filterType === 'publishers') {
                 const discoveredPublishers = await this.reportsProvider.getDiscoveredPublishers();
                 const selectedPublishers = vscode.workspace.getConfiguration('gradle-report-viewer').get<string[]>('selectedPublishers') || [];
-                const allAreSelected = selectedPublishers.length === 0; // Empty means all are selected by default
 
-                return discoveredPublishers.map(pub => new FilterEntryItem(pub, 'publisher', allAreSelected || selectedPublishers.includes(pub)));
+                return discoveredPublishers.map(pub => new FilterEntryItem(pub, 'publisher', selectedPublishers.includes(pub)));
             }
             if (element.filterType === 'extensions') {
                 const discoveredExtensions = await this.reportsProvider.getDiscoveredFileExtensions();
                 const selectedExtensions = vscode.workspace.getConfiguration('gradle-report-viewer').get<string[]>('selectedExtensions') || [];
-                const allAreSelected = selectedExtensions.length === 0;
 
-                return discoveredExtensions.map(ext => new FilterEntryItem(ext, 'extension', allAreSelected || selectedExtensions.includes(ext)));
+                return discoveredExtensions.map(ext => new FilterEntryItem(ext, 'extension', selectedExtensions.includes(ext)));
             }
         }
         return [];
