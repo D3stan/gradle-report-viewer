@@ -2,7 +2,7 @@
   "name": "gradle-report-viewer",
   "displayName": "Gradle Report Viewer",
   "description": "A VS Code extension to view Gradle reports (Checkstyle, PMD, etc.) without an external browser.",
-  "version": "0.0.2",
+  "version": "0.0.6",
   "repository": {
     "type": "git",
     "url": "https://github.com/D3stan/gradle-report-viewer"
@@ -13,7 +13,6 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -28,6 +27,16 @@
       {
         "command": "gradle-report-viewer.selectPublishers",
         "title": "Select Report Publishers to Display",
+        "category": "Gradle Report Viewer"
+      },
+      {
+        "command": "gradle-report-viewer.setPublisherFilter",
+        "title": "Set Publisher Filter (Internal)",
+        "category": "Gradle Report Viewer"
+      },
+      {
+        "command": "gradle-report-viewer.setExtensionFilter",
+        "title": "Set Extension Filter (Internal)",
         "category": "Gradle Report Viewer"
       }
     ],
@@ -47,6 +56,12 @@
           "name": "Available Reports",
           "type": "tree",
           "icon": "media/icon.svg"
+        },
+        {
+          "id": "gradleReportFiltersView",
+          "name": "Report Filters",
+          "type": "tree",
+          "icon": "media/icon.svg"
         }
       ]
     },
@@ -56,7 +71,15 @@
         "gradle-report-viewer.selectedPublishers": {
           "type": "array",
           "default": [],
-          "description": "Specifies which report publishers (subfolders in build/reports) to display. If not configured, all discovered publishers are shown.",
+          "description": "Specifies which report publishers (subfolders in build/reports) to display. If empty, all discovered publishers are shown.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "gradle-report-viewer.selectedExtensions": {
+          "type": "array",
+          "default": [],
+          "description": "Specifies which file extensions (e.g., .html, .xml) to display. If empty, all discovered relevant extensions are shown.",
           "items": {
             "type": "string"
           }
@@ -82,5 +105,9 @@
     "typescript": "^5.8.3",
     "@vscode/test-cli": "^0.0.10",
     "@vscode/test-electron": "^2.5.2"
-  }
+  },
+  "activationEvents": [
+    "onView:gradleReportView",
+    "onView:gradleReportFiltersView"
+  ]
 }
