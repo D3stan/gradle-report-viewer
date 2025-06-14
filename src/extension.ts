@@ -8,6 +8,9 @@ import * as path from 'path';
 // Your extension is activated the very first time the command is executed
 export function activate(context: vscode.ExtensionContext) {
 
+    console.log('Gradle Report Viewer extension is activating.');
+    const reportPanels = new Map<string, vscode.WebviewPanel>();
+
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders || workspaceFolders.length === 0) {
         vscode.window.showInformationMessage('No workspace folder open.');
@@ -50,31 +53,86 @@ export function activate(context: vscode.ExtensionContext) {
         filtersProvider.refresh(); // Refresh filters too
     }));
 
-    context.subscriptions.push(vscode.commands.registerCommand('gradle-report-viewer.openReport', (item: ReportItem | PublisherItem) => {
-        if (item instanceof ReportItem && item.resourceUri) {
-            const reportPath = item.resourceUri.fsPath;
-            const panel = vscode.window.createWebviewPanel(
-                'gradleReport',
-                `Report: ${path.basename(reportPath)}`,
-                vscode.ViewColumn.One,
-                {
-                    enableScripts: true,
-                    localResourceRoots: [vscode.Uri.file(path.dirname(reportPath))]
-                }
-            );
+    context.subscriptions.push(vscode.commands.registerCommand('gradle-report-viewer.openReport', (uriOrItem: vscode.Uri | ReportItem) => {
+        let reportUri: vscode.Uri | undefined;
 
-            fs.readFile(reportPath, 'utf8', (err, data) => {
-                if (err) {
-                    vscode.window.showErrorMessage(`Error reading report file: ${err.message}`);
-                    return;
-                }
-                const webviewContent = data.replace(/(href|src)=["'](?!http|data:)([^"']+)["']/g, (match, attr, filePath) => {
-                    const onDiskPath = vscode.Uri.file(path.resolve(path.dirname(reportPath), filePath));
-                    const webviewUri = panel.webview.asWebviewUri(onDiskPath);
-                    return `${attr}="${webviewUri}"`;
-                });
-                panel.webview.html = webviewContent;
+        if (uriOrItem instanceof vscode.Uri) {
+            reportUri = uriOrItem;
+            console.log('openReport command triggered with URI:', reportUri.fsPath);
+        } else if (uriOrItem instanceof ReportItem && uriOrItem.resourceUri) {
+            reportUri = uriOrItem.resourceUri;
+            console.log('openReport command triggered with ReportItem:', reportUri.fsPath);
+        }
+
+        if (!reportUri) {
+            console.warn('openReport called with an invalid or unexpected item:', uriOrItem);
+            return;
+        }
+
+        const reportPath = reportUri.fsPath;
+        const existingPanel = reportPanels.get(reportPath);
+        if (existingPanel) {
+            console.log('Found existing panel for this report. Revealing it.');
+            existingPanel.reveal();
+            return;
+        }
+
+        console.log('No existing panel found. Creating a new one for:', reportPath);
+        const panel = vscode.window.createWebviewPanel(
+            'gradleReport',
+            `Report: ${path.basename(reportPath)}`,
+            vscode.ViewColumn.Active,
+            {
+                enableScripts: true,
+                localResourceRoots: [vscode.Uri.file(path.dirname(reportPath))],
+                retainContextWhenHidden: true
+            }
+        );
+        reportPanels.set(reportPath, panel);
+
+        panel.onDidDispose(
+            () => {
+                console.log(`Panel for ${reportPath} was disposed.`);
+                reportPanels.delete(reportPath);
+            },
+            null,
+            context.subscriptions
+        );
+
+        try {
+            console.log(`Reading file sync: ${reportPath}`);
+            const data = fs.readFileSync(reportPath, 'utf8');
+
+            let webviewContent = data.replace(/(href|src)=["'](?!http|data:)([^"']+)["']/g, (match, attr, filePath) => {
+                const onDiskPath = vscode.Uri.file(path.resolve(path.dirname(reportPath), filePath));
+                const webviewUri = panel.webview.asWebviewUri(onDiskPath);
+                return `${attr}="${webviewUri}"`;
             });
+
+            // Inject a minimal style for readability on any theme
+            const style = `
+<style>
+    body {
+        background-color: white;
+        color: black;
+    }
+    body a {
+        color: #0000EE;
+    }
+</style>`;
+
+            if (/<head[^>]*>/i.test(webviewContent)) {
+                webviewContent = webviewContent.replace(/<head[^>]*>/i, `$&${style}`);
+            } else {
+                webviewContent = style + webviewContent;
+            }
+
+            console.log('Setting webview HTML content.');
+            panel.webview.html = webviewContent;
+
+        } catch (err: any) {
+            console.error(`Error reading report file: ${err.message}`);
+            vscode.window.showErrorMessage(`Error reading report file: ${err.message}`);
         }
     }));
 
@@ -264,7 +322,7 @@ export class GradleReportsProvider implements vscode.TreeDataProvider<vscode.Tre
                             {
                                 command: 'gradle-report-viewer.openReport',
                                 title: 'Open Report',
-                                arguments: [new ReportItem(path.basename(uri.fsPath), publisherName, uri, vscode.TreeItemCollapsibleState.None)]
+                                arguments: [uri]
                             }
                         ));
                 } catch (error) {
