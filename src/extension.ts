@@ -2,6 +2,9 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 
+// --------- EXTENSION ENTRY POINTS ---------
+
+// Activates the Gradle Report Viewer extension and sets up providers, commands, and UI.
 export function activate(context: vscode.ExtensionContext) {
     console.log('Gradle Report Viewer extension is activating.');
     const reportPanels = new Map<string, { panel: vscode.WebviewPanel, watcher: fs.FSWatcher }>();
@@ -24,8 +27,227 @@ export function activate(context: vscode.ExtensionContext) {
     console.log('Congratulations, your extension "gradle-report-viewer" is now active!');
 }
 
+// Deactivates the extension (cleanup if needed).
 export function deactivate() {}
 
+// --------- PROVIDER CLASSES ---------
+
+// Provides the Gradle reports tree view, handles filtering and file discovery.
+export class GradleReportsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
+    private _onDidChangeTreeData: vscode.EventEmitter<vscode.TreeItem | undefined | null | void> = new vscode.EventEmitter<vscode.TreeItem | undefined | null | void>();
+    readonly onDidChangeTreeData: vscode.Event<vscode.TreeItem | undefined | null | void> = this._onDidChangeTreeData.event;
+    private discoveredPublishersCache: string[] | undefined;
+    private discoveredExtensionsCache: string[] | undefined;
+    constructor(private workspaceRootUri: vscode.Uri | undefined, private context: vscode.ExtensionContext) {
+        vscode.workspace.onDidChangeConfiguration(e => {
+            if (e.affectsConfiguration('gradle-report-viewer.selectedPublishers') ||
+                e.affectsConfiguration('gradle-report-viewer.selectedExtensions')) {
+                this.refresh();
+            }
+        });
+    }
+    // Returns all discovered publishers (subfolders in build/reports)
+    async getDiscoveredPublishers(): Promise<string[]> {
+        if (!this.workspaceRootUri) { return []; }
+        if (this.discoveredPublishersCache) { return this.discoveredPublishersCache; }
+        const reportsRootPath = vscode.Uri.joinPath(this.workspaceRootUri, 'build', 'reports');
+        try {
+            const entries = await vscode.workspace.fs.readDirectory(reportsRootPath);
+            this.discoveredPublishersCache = entries
+                .filter(([, type]) => type === vscode.FileType.Directory)
+                .map(([name]) => name);
+            return this.discoveredPublishersCache;
+        } catch (error) {
+            this.discoveredPublishersCache = [];
+            return [];
+        }
+    }
+    // Returns all discovered file extensions (e.g., .html, .xml) in publisher folders
+    async getDiscoveredFileExtensions(): Promise<string[]> {
+        if (!this.workspaceRootUri) { return []; }
+        if (this.discoveredExtensionsCache) { return this.discoveredExtensionsCache; }
+        const publishers = await this.getDiscoveredPublishers();
+        const allExtensions = new Set<string>();
+        for (const publisher of publishers) {
+            const publisherPath = vscode.Uri.joinPath(this.workspaceRootUri, 'build', 'reports', publisher);
+            try {
+                const filesInPublisher = await vscode.workspace.findFiles(new vscode.RelativePattern(publisherPath, '**/*.*'), '**/node_modules/**', 500);
+                for (const fileUri of filesInPublisher) {
+                    const ext = path.extname(fileUri.fsPath);
+                    if (ext && (ext === '.html' || ext === '.xml')) {
+                        allExtensions.add(ext);
+                    }
+                }
+            } catch (error) {
+                console.warn(`Error scanning extensions in ${publisher}: ${error}`);
+            }
+        }
+        this.discoveredExtensionsCache = Array.from(allExtensions);
+        return this.discoveredExtensionsCache;
+    }
+    // Refreshes the tree view and clears caches
+    refresh(): void {
+        this.discoveredPublishersCache = undefined;
+        this.discoveredExtensionsCache = undefined;
+        this._onDidChangeTreeData.fire();
+    }
+    // Returns the tree item for the given element
+    getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
+        return element;
+    }
+    // Returns the children for the given element (or root)
+    async getChildren(element?: vscode.TreeItem): Promise<vscode.TreeItem[]> {
+        if (!this.workspaceRootUri) {
+            vscode.window.showInformationMessage('No workspace found for Gradle reports');
+            return [];
+        }
+        const allDiscoveredPublishers = await this.getDiscoveredPublishers();
+        const effectiveSelectedPublishers = vscode.workspace.getConfiguration('gradle-report-viewer').get<string[]>('selectedPublishers') || [];
+        const allDiscoveredExtensions = await this.getDiscoveredFileExtensions();
+        const effectiveSelectedExtensions = vscode.workspace.getConfiguration('gradle-report-viewer').get<string[]>('selectedExtensions') || [];
+        if (allDiscoveredPublishers.length === 0 && !element) {
+            vscode.window.showInformationMessage('No report subfolders found in build/reports. Please build your project.');
+            return [];
+        }
+        if (element) {
+            if (element instanceof PublisherItem) {
+                const publisherName = element.label;
+                if (!effectiveSelectedPublishers.includes(publisherName)) {
+                    return [];
+                }
+                const publisherPath = vscode.Uri.joinPath(this.workspaceRootUri, 'build', 'reports', publisherName);
+                const reportSearchPattern = new vscode.RelativePattern(publisherPath, `**/*{${effectiveSelectedExtensions.join(',')}}`);
+                try {
+                    const uris = await vscode.workspace.findFiles(reportSearchPattern, '**/node_modules/**', 200);
+                    return uris
+                        .filter(uri => effectiveSelectedExtensions.includes(path.extname(uri.fsPath)))
+                        .map(uri => new ReportItem(
+                            path.basename(uri.fsPath),
+                            publisherName,
+                            uri,
+                            vscode.TreeItemCollapsibleState.None,
+                            {
+                                command: 'gradle-report-viewer.openReport',
+                                title: 'Open Report',
+                                arguments: [uri]
+                            }
+                        ));
+                } catch (error) {
+                    console.error(`Error finding reports for publisher ${publisherName}: ${error}`);
+                    return [];
+                }
+            }
+            return [];
+        } else {
+            return effectiveSelectedPublishers.map(publisher => new PublisherItem(publisher, vscode.TreeItemCollapsibleState.Collapsed));
+        }
+    }
+}
+
+// Provides the filter tree view for publishers and file extensions.
+export class GradleReportFiltersProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
+    private _onDidChangeTreeData: vscode.EventEmitter<vscode.TreeItem | undefined | null | void> = new vscode.EventEmitter<vscode.TreeItem | undefined | null | void>();
+    readonly onDidChangeTreeData: vscode.Event<vscode.TreeItem | undefined | null | void> = this._onDidChangeTreeData.event;
+    constructor(
+        private workspaceRootUri: vscode.Uri | undefined,
+        private context: vscode.ExtensionContext,
+        private reportsProvider: GradleReportsProvider
+    ) {
+        vscode.workspace.onDidChangeConfiguration(e => {
+            if (e.affectsConfiguration('gradle-report-viewer.selectedPublishers') ||
+                e.affectsConfiguration('gradle-report-viewer.selectedExtensions')) {
+                this.refresh();
+            }
+        });
+    }
+    // Refreshes the filter tree view
+    refresh(): void {
+        this._onDidChangeTreeData.fire();
+    }
+    // Returns the tree item for the given element
+    getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
+        return element;
+    }
+    // Returns the children for the given element (or root)
+    async getChildren(element?: vscode.TreeItem): Promise<vscode.TreeItem[]> {
+        if (!this.workspaceRootUri) { return []; }
+        if (!element) {
+            return [new FilterCategoryItem('Publishers', 'publishers'), new FilterCategoryItem('File Extensions', 'extensions')];
+        }
+        if (element instanceof FilterCategoryItem) {
+            if (element.filterType === 'publishers') {
+                const discoveredPublishers = await this.reportsProvider.getDiscoveredPublishers();
+                const selectedPublishers = vscode.workspace.getConfiguration('gradle-report-viewer').get<string[]>('selectedPublishers') || [];
+                return discoveredPublishers.map(pub => new FilterEntryItem(pub, 'publisher', selectedPublishers.includes(pub)));
+            }
+            if (element.filterType === 'extensions') {
+                const discoveredExtensions = await this.reportsProvider.getDiscoveredFileExtensions();
+                const selectedExtensions = vscode.workspace.getConfiguration('gradle-report-viewer').get<string[]>('selectedExtensions') || [];
+                return discoveredExtensions.map(ext => new FilterEntryItem(ext, 'extension', selectedExtensions.includes(ext)));
+            }
+        }
+        return [];
+    }
+}
+
+// --------- DATA CLASSES ---------
+
+// Represents a publisher folder in the tree view.
+class PublisherItem extends vscode.TreeItem {
+    constructor(
+        public readonly label: string,
+        public readonly collapsibleState: vscode.TreeItemCollapsibleState
+    ) {
+        super(label, collapsibleState);
+        this.tooltip = `Reports from ${this.label}`;
+        this.iconPath = new vscode.ThemeIcon('folder');
+    }
+}
+
+// Represents a report file in the tree view.
+class ReportItem extends vscode.TreeItem {
+    constructor(
+        public readonly label: string,
+        public readonly description: string,
+        public readonly resourceUri: vscode.Uri,
+        public readonly collapsibleState: vscode.TreeItemCollapsibleState,
+        public readonly command?: vscode.Command
+    ) {
+        super(label, collapsibleState);
+        this.tooltip = `${this.label} - ${this.description}`;
+        this.iconPath = new vscode.ThemeIcon('file-code');
+    }
+}
+
+// Represents a filter category (publishers or extensions) in the filter tree view.
+class FilterCategoryItem extends vscode.TreeItem {
+    constructor(public readonly label: string, public readonly filterType: 'publishers' | 'extensions') {
+        super(label, vscode.TreeItemCollapsibleState.Expanded);
+        this.iconPath = new vscode.ThemeIcon('filter');
+    }
+}
+
+// Represents a filter entry (publisher or extension) in the filter tree view.
+class FilterEntryItem extends vscode.TreeItem {
+    constructor(
+        public readonly label: string,
+        public readonly entryType: 'publisher' | 'extension',
+        public readonly isChecked: boolean
+    ) {
+        super(label, vscode.TreeItemCollapsibleState.None);
+        this.checkboxState = isChecked ? vscode.TreeItemCheckboxState.Checked : vscode.TreeItemCheckboxState.Unchecked;
+        this.command = {
+            title: isChecked ? 'Deselect' : 'Select',
+            command: entryType === 'publisher' ? 'gradle-report-viewer.togglePublisherSelection' : 'gradle-report-viewer.toggleExtensionSelection',
+            arguments: [this.label]
+        };
+        this.iconPath = entryType === 'publisher' ? new vscode.ThemeIcon('symbol-folder') : new vscode.ThemeIcon('symbol-file');
+    }
+}
+
+// --------- UTILITY & HELPER FUNCTIONS ---------
+
+// Updates the webview panel with the content of the report file, injecting styles and reload button.
 function updateWebviewContent(panel: vscode.WebviewPanel, reportPath: string) {
     try {
         console.log(`Updating webview for: ${reportPath}`);
@@ -89,203 +311,7 @@ function updateWebviewContent(panel: vscode.WebviewPanel, reportPath: string) {
     }
 }
 
-export class GradleReportsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
-    private _onDidChangeTreeData: vscode.EventEmitter<vscode.TreeItem | undefined | null | void> = new vscode.EventEmitter<vscode.TreeItem | undefined | null | void>();
-    readonly onDidChangeTreeData: vscode.Event<vscode.TreeItem | undefined | null | void> = this._onDidChangeTreeData.event;
-    private discoveredPublishersCache: string[] | undefined;
-    private discoveredExtensionsCache: string[] | undefined;
-    constructor(private workspaceRootUri: vscode.Uri | undefined, private context: vscode.ExtensionContext) {
-        vscode.workspace.onDidChangeConfiguration(e => {
-            if (e.affectsConfiguration('gradle-report-viewer.selectedPublishers') ||
-                e.affectsConfiguration('gradle-report-viewer.selectedExtensions')) {
-                this.refresh();
-            }
-        });
-    }
-    async getDiscoveredPublishers(): Promise<string[]> {
-        if (!this.workspaceRootUri) { return []; }
-        if (this.discoveredPublishersCache) { return this.discoveredPublishersCache; }
-        const reportsRootPath = vscode.Uri.joinPath(this.workspaceRootUri, 'build', 'reports');
-        try {
-            const entries = await vscode.workspace.fs.readDirectory(reportsRootPath);
-            this.discoveredPublishersCache = entries
-                .filter(([, type]) => type === vscode.FileType.Directory)
-                .map(([name]) => name);
-            return this.discoveredPublishersCache;
-        } catch (error) {
-            this.discoveredPublishersCache = [];
-            return [];
-        }
-    }
-    async getDiscoveredFileExtensions(): Promise<string[]> {
-        if (!this.workspaceRootUri) { return []; }
-        if (this.discoveredExtensionsCache) { return this.discoveredExtensionsCache; }
-        const publishers = await this.getDiscoveredPublishers();
-        const allExtensions = new Set<string>();
-        for (const publisher of publishers) {
-            const publisherPath = vscode.Uri.joinPath(this.workspaceRootUri, 'build', 'reports', publisher);
-            try {
-                const filesInPublisher = await vscode.workspace.findFiles(new vscode.RelativePattern(publisherPath, '**/*.*'), '**/node_modules/**', 500);
-                for (const fileUri of filesInPublisher) {
-                    const ext = path.extname(fileUri.fsPath);
-                    if (ext && (ext === '.html' || ext === '.xml')) {
-                        allExtensions.add(ext);
-                    }
-                }
-            } catch (error) {
-                console.warn(`Error scanning extensions in ${publisher}: ${error}`);
-            }
-        }
-        this.discoveredExtensionsCache = Array.from(allExtensions);
-        return this.discoveredExtensionsCache;
-    }
-    refresh(): void {
-        this.discoveredPublishersCache = undefined;
-        this.discoveredExtensionsCache = undefined;
-        this._onDidChangeTreeData.fire();
-    }
-    getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
-        return element;
-    }
-    async getChildren(element?: vscode.TreeItem): Promise<vscode.TreeItem[]> {
-        if (!this.workspaceRootUri) {
-            vscode.window.showInformationMessage('No workspace found for Gradle reports');
-            return [];
-        }
-        const allDiscoveredPublishers = await this.getDiscoveredPublishers();
-        const effectiveSelectedPublishers = vscode.workspace.getConfiguration('gradle-report-viewer').get<string[]>('selectedPublishers') || [];
-        const allDiscoveredExtensions = await this.getDiscoveredFileExtensions();
-        const effectiveSelectedExtensions = vscode.workspace.getConfiguration('gradle-report-viewer').get<string[]>('selectedExtensions') || [];
-        if (allDiscoveredPublishers.length === 0 && !element) {
-            vscode.window.showInformationMessage('No report subfolders found in build/reports. Please build your project.');
-            return [];
-        }
-        if (element) {
-            if (element instanceof PublisherItem) {
-                const publisherName = element.label;
-                if (!effectiveSelectedPublishers.includes(publisherName)) {
-                    return [];
-                }
-                const publisherPath = vscode.Uri.joinPath(this.workspaceRootUri, 'build', 'reports', publisherName);
-                const reportSearchPattern = new vscode.RelativePattern(publisherPath, `**/*{${effectiveSelectedExtensions.join(',')}}`);
-                try {
-                    const uris = await vscode.workspace.findFiles(reportSearchPattern, '**/node_modules/**', 200);
-                    return uris
-                        .filter(uri => effectiveSelectedExtensions.includes(path.extname(uri.fsPath)))
-                        .map(uri => new ReportItem(
-                            path.basename(uri.fsPath),
-                            publisherName,
-                            uri,
-                            vscode.TreeItemCollapsibleState.None,
-                            {
-                                command: 'gradle-report-viewer.openReport',
-                                title: 'Open Report',
-                                arguments: [uri]
-                            }
-                        ));
-                } catch (error) {
-                    console.error(`Error finding reports for publisher ${publisherName}: ${error}`);
-                    return [];
-                }
-            }
-            return [];
-        } else {
-            return effectiveSelectedPublishers.map(publisher => new PublisherItem(publisher, vscode.TreeItemCollapsibleState.Collapsed));
-        }
-    }
-}
-
-export class GradleReportFiltersProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
-    private _onDidChangeTreeData: vscode.EventEmitter<vscode.TreeItem | undefined | null | void> = new vscode.EventEmitter<vscode.TreeItem | undefined | null | void>();
-    readonly onDidChangeTreeData: vscode.Event<vscode.TreeItem | undefined | null | void> = this._onDidChangeTreeData.event;
-    constructor(
-        private workspaceRootUri: vscode.Uri | undefined,
-        private context: vscode.ExtensionContext,
-        private reportsProvider: GradleReportsProvider
-    ) {
-        vscode.workspace.onDidChangeConfiguration(e => {
-            if (e.affectsConfiguration('gradle-report-viewer.selectedPublishers') ||
-                e.affectsConfiguration('gradle-report-viewer.selectedExtensions')) {
-                this.refresh();
-            }
-        });
-    }
-    refresh(): void {
-        this._onDidChangeTreeData.fire();
-    }
-    getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
-        return element;
-    }
-    async getChildren(element?: vscode.TreeItem): Promise<vscode.TreeItem[]> {
-        if (!this.workspaceRootUri) { return []; }
-        if (!element) {
-            return [new FilterCategoryItem('Publishers', 'publishers'), new FilterCategoryItem('File Extensions', 'extensions')];
-        }
-        if (element instanceof FilterCategoryItem) {
-            if (element.filterType === 'publishers') {
-                const discoveredPublishers = await this.reportsProvider.getDiscoveredPublishers();
-                const selectedPublishers = vscode.workspace.getConfiguration('gradle-report-viewer').get<string[]>('selectedPublishers') || [];
-                return discoveredPublishers.map(pub => new FilterEntryItem(pub, 'publisher', selectedPublishers.includes(pub)));
-            }
-            if (element.filterType === 'extensions') {
-                const discoveredExtensions = await this.reportsProvider.getDiscoveredFileExtensions();
-                const selectedExtensions = vscode.workspace.getConfiguration('gradle-report-viewer').get<string[]>('selectedExtensions') || [];
-                return discoveredExtensions.map(ext => new FilterEntryItem(ext, 'extension', selectedExtensions.includes(ext)));
-            }
-        }
-        return [];
-    }
-}
-
-class PublisherItem extends vscode.TreeItem {
-    constructor(
-        public readonly label: string,
-        public readonly collapsibleState: vscode.TreeItemCollapsibleState
-    ) {
-        super(label, collapsibleState);
-        this.tooltip = `Reports from ${this.label}`;
-        this.iconPath = new vscode.ThemeIcon('folder');
-    }
-}
-
-class ReportItem extends vscode.TreeItem {
-    constructor(
-        public readonly label: string,
-        public readonly description: string,
-        public readonly resourceUri: vscode.Uri,
-        public readonly collapsibleState: vscode.TreeItemCollapsibleState,
-        public readonly command?: vscode.Command
-    ) {
-        super(label, collapsibleState);
-        this.tooltip = `${this.label} - ${this.description}`;
-        this.iconPath = new vscode.ThemeIcon('file-code');
-    }
-}
-
-class FilterCategoryItem extends vscode.TreeItem {
-    constructor(public readonly label: string, public readonly filterType: 'publishers' | 'extensions') {
-        super(label, vscode.TreeItemCollapsibleState.Expanded);
-        this.iconPath = new vscode.ThemeIcon('filter');
-    }
-}
-
-class FilterEntryItem extends vscode.TreeItem {
-    constructor(
-        public readonly label: string,
-        public readonly entryType: 'publisher' | 'extension',
-        public readonly isChecked: boolean
-    ) {
-        super(label, vscode.TreeItemCollapsibleState.None);
-        this.checkboxState = isChecked ? vscode.TreeItemCheckboxState.Checked : vscode.TreeItemCheckboxState.Unchecked;
-        this.command = {
-            title: isChecked ? 'Deselect' : 'Select',
-            command: entryType === 'publisher' ? 'gradle-report-viewer.togglePublisherSelection' : 'gradle-report-viewer.toggleExtensionSelection',
-            arguments: [this.label]
-        };
-        this.iconPath = entryType === 'publisher' ? new vscode.ThemeIcon('symbol-folder') : new vscode.ThemeIcon('symbol-file');
-    }
-}
-
+// Handles checkbox state changes in the filter tree view.
 function handleCheckboxStateChange(e: any) {
     for (const [treeItem] of e.items) {
         const item = treeItem as FilterEntryItem | undefined as any;
@@ -301,6 +327,7 @@ function handleCheckboxStateChange(e: any) {
     }
 }
 
+// Registers all extension commands (open report, toggle filters, etc).
 function registerCommands(context: vscode.ExtensionContext, reportsProvider: GradleReportsProvider, filtersProvider: GradleReportFiltersProvider, reportPanels: Map<string, { panel: vscode.WebviewPanel, watcher: fs.FSWatcher }>) {
     context.subscriptions.push(vscode.commands.registerCommand('gradle-report-viewer.showReports', () => {
         reportsProvider.refresh();
@@ -414,6 +441,7 @@ function registerCommands(context: vscode.ExtensionContext, reportsProvider: Gra
     }));
 }
 
+// Ensures that default selections are set for publishers and extensions if config is empty.
 function ensureDefaultSelections(reportsProvider: GradleReportsProvider) {
     (async () => {
         const cfg = vscode.workspace.getConfiguration('gradle-report-viewer');
