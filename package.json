@@ -3,6 +3,7 @@
   "displayName": "Gradle Report Viewer",
   "description": "A VS Code extension to view Gradle reports (Checkstyle, PMD, etc.) without an external browser.",
   "version": "0.1.3",
+  "publisher": "D3stan",
   "repository": {
     "type": "git",
     "url": "https://github.com/D3stan/gradle-report-viewer"
