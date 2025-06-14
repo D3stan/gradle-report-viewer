@@ -4,12 +4,86 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 
+function updateWebviewContent(panel: vscode.WebviewPanel, reportPath: string) {
+    try {
+        console.log(`Updating webview for: ${reportPath}`);
+        const data = fs.readFileSync(reportPath, 'utf8');
+
+        let webviewContent = data.replace(/(href|src)=["'](?!http|data:)([^"']+)["']/g, (match, attr, filePath) => {
+            const onDiskPath = vscode.Uri.file(path.resolve(path.dirname(reportPath), filePath));
+            const webviewUri = panel.webview.asWebviewUri(onDiskPath);
+            return `${attr}="${webviewUri}"`;
+        });
+
+        // Inject a minimal style for readability on any theme and a reload button
+        const style = `
+<style>
+    body {
+        background-color: white;
+        color: black;
+    }
+    body a {
+        color: #0000EE;
+    }
+    .reload-button {
+        position: fixed;
+        top: 10px;
+        right: 10px;
+        padding: 8px 12px;
+        background-color: #007ACC;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        z-index: 1000;
+    }
+    .reload-button:hover {
+        background-color: #005f9e;
+    }
+</style>`;
+
+        const script = `
+<script>
+    const vscode = acquireVsCodeApi();
+    function reloadReport() {
+        vscode.postMessage({
+            command: 'reload'
+        });
+    }
+</script>`;
+
+        const reloadButton = `<button class="reload-button" onclick="reloadReport()">Reload</button>`;
+
+
+        if (/<head[^>]*>/i.test(webviewContent)) {
+            webviewContent = webviewContent.replace(/<head[^>]*>/i, `$&${style}${script}`);
+        } else {
+            webviewContent = style + script + webviewContent;
+        }
+
+        if (/<body/i.test(webviewContent)) {
+			// Use a regex to add the button after the opening body tag, whatever its attributes.
+            webviewContent = webviewContent.replace(/<body([^>]*)>/i, `<body$1>${reloadButton}`);
+        } else {
+            webviewContent += reloadButton;
+        }
+
+        console.log('Setting webview HTML content.');
+        panel.webview.html = webviewContent;
+
+    } catch (err: any) {
+        console.error(`Error reading report file: ${err.message}`);
+        panel.webview.html = `<body>Error loading report: ${err.message}. It may have been removed.</body>`;
+        vscode.window.showErrorMessage(`Error reading report file: ${err.message}`);
+    }
+}
+
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
 export function activate(context: vscode.ExtensionContext) {
 
     console.log('Gradle Report Viewer extension is activating.');
-    const reportPanels = new Map<string, vscode.WebviewPanel>();
+    const reportPanels = new Map<string, { panel: vscode.WebviewPanel, watcher: fs.FSWatcher }>();
 
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders || workspaceFolders.length === 0) {
@@ -70,10 +144,10 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         const reportPath = reportUri.fsPath;
-        const existingPanel = reportPanels.get(reportPath);
-        if (existingPanel) {
+        const existingPanelInfo = reportPanels.get(reportPath);
+        if (existingPanelInfo) {
             console.log('Found existing panel for this report. Revealing it.');
-            existingPanel.reveal();
+            existingPanelInfo.panel.reveal();
             return;
         }
 
@@ -88,52 +162,44 @@ export function activate(context: vscode.ExtensionContext) {
                 retainContextWhenHidden: true
             }
         );
-        reportPanels.set(reportPath, panel);
+
+        // Initial load
+        updateWebviewContent(panel, reportPath);
+
+        // Watch for file changes
+        const watcher = fs.watch(reportPath, (event, filename) => {
+            if (event === 'change') {
+                console.log(`Report file ${reportPath} changed, reloading.`);
+                updateWebviewContent(panel, reportPath);
+            }
+        });
+
+        // Handle messages from the webview (for reload button)
+        panel.webview.onDidReceiveMessage(
+            message => {
+                if (message.command === 'reload') {
+                    console.log('Reload message received from webview.');
+                    updateWebviewContent(panel, reportPath);
+                }
+            },
+            undefined,
+            context.subscriptions
+        );
+        
+        reportPanels.set(reportPath, { panel, watcher });
 
         panel.onDidDispose(
             () => {
                 console.log(`Panel for ${reportPath} was disposed.`);
-                reportPanels.delete(reportPath);
+                const panelInfo = reportPanels.get(reportPath);
+                if (panelInfo) {
+                    panelInfo.watcher.close();
+                    reportPanels.delete(reportPath);
+                }
             },
             null,
             context.subscriptions
         );
-
-        try {
-            console.log(`Reading file sync: ${reportPath}`);
-            const data = fs.readFileSync(reportPath, 'utf8');
-
-            let webviewContent = data.replace(/(href|src)=["'](?!http|data:)([^"']+)["']/g, (match, attr, filePath) => {
-                const onDiskPath = vscode.Uri.file(path.resolve(path.dirname(reportPath), filePath));
-                const webviewUri = panel.webview.asWebviewUri(onDiskPath);
-                return `${attr}="${webviewUri}"`;
-            });
-
-            // Inject a minimal style for readability on any theme
-            const style = `
-<style>
-    body {
-        background-color: white;
-        color: black;
-    }
-    body a {
-        color: #0000EE;
-    }
-</style>`;
-
-            if (/<head[^>]*>/i.test(webviewContent)) {
-                webviewContent = webviewContent.replace(/<head[^>]*>/i, `$&${style}`);
-            } else {
-                webviewContent = style + webviewContent;
-            }
-
-            console.log('Setting webview HTML content.');
-            panel.webview.html = webviewContent;
-
-        } catch (err: any) {
-            console.error(`Error reading report file: ${err.message}`);
-            vscode.window.showErrorMessage(`Error reading report file: ${err.message}`);
-        }
     }));
 
     // The selectPublishers command might be less relevant now, but we can keep it or adapt it later.
