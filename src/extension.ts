@@ -8,7 +8,8 @@ import * as path from 'path';
 // Your extension is activated the very first time the command is executed
 export function activate(context: vscode.ExtensionContext) {
 
-    const reportsProvider = new GradleReportsProvider(vscode.workspace.rootPath);
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const reportsProvider = new GradleReportsProvider(workspaceRoot);
     vscode.window.registerTreeDataProvider('gradleReportView', reportsProvider);
 
     vscode.commands.registerCommand('gradle-report-viewer.showReports', () => {
@@ -73,7 +74,7 @@ export class GradleReportsProvider implements vscode.TreeDataProvider<ReportItem
             return Promise.resolve([]);
         } else {
             // Root level, list all .html and .xml files in typical Gradle report locations
-            const reportPattern = '**/build/reports/**/*.{html,xml}';
+            const reportPattern = '**/build/reports/**/*.{html}';
             return vscode.workspace.findFiles(reportPattern, '**/node_modules/**', 100)
                 .then(uris => {
                     return uris.map(uri => {
@@ -100,7 +101,6 @@ export class GradleReportsProvider implements vscode.TreeDataProvider<ReportItem
         if (filePath.includes('spotbugs') || filePath.includes('findbugs')) return 'SpotBugs/FindBugs';
         if (filePath.includes('jacoco')) return 'JaCoCo';
         if (filePath.includes('tests')) return 'Test Results';
-        if (filePath.endsWith('.xml')) return 'XML Report';
         return 'HTML Report';
     }
 }
